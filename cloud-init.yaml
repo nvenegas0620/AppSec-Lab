@@ -1,0 +1,146 @@
+#cloud-config
+package_update: true
+packages:
+  - docker.io
+  - docker-compose
+  - curl
+
+write_files:
+  # Requisitos kernel para SonarQube (Elasticsearch)
+  - path: /etc/sysctl.d/99-sonar.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      vm.max_map_count=262144
+      fs.file-max=131072
+
+  # Stack: SonarQube + Dependency-Track (API+Frontend) + Postgres
+  - path: /opt/appsec/docker-compose.yml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      version: "3.8"
+      services:
+        dtrack-db:
+          image: postgres:13
+          container_name: dtrack-postgres
+          restart: always
+          environment:
+            POSTGRES_USER: dtrack
+            POSTGRES_PASSWORD: dtrackpass
+            POSTGRES_DB: dtrack
+          volumes:
+            - /opt/dtrack/postgres:/var/lib/postgresql/data
+          healthcheck:
+            test: ["CMD-SHELL","pg_isready -U dtrack"]
+            interval: 10s
+            retries: 20
+            timeout: 5s
+          networks: [appsec-net]
+
+        dependency-track:
+          image: dependencytrack/apiserver:latest
+          container_name: dependency-track
+          restart: always
+          environment:
+            # JDBC a Postgres en el hostname del servicio compose
+            ALPINE_DATABASE_URL: "jdbc:postgresql://dtrack-db:5432/dtrack"
+            ALPINE_DATABASE_USERNAME: "dtrack"
+            ALPINE_DATABASE_PASSWORD: "dtrackpass"
+            # Imprescindible para que no intente usar H2
+            ALPINE_DATABASE_DRIVER: "org.postgresql.Driver"
+          ports:
+            - "8081:8080"   # expone API en 8081 del host
+          volumes:
+            - /opt/dtrack/data:/data
+          depends_on:
+            dtrack-db:
+              condition: service_healthy
+          networks: [appsec-net]
+
+        dtrack-frontend:
+          image: dependencytrack/frontend:latest
+          container_name: dtrack-frontend
+          restart: always
+          environment:
+            # Placeholder que se sustituye en runcmd con la IP pública real
+            API_BASE_URL: "http://__PUBLIC_API__:8081"
+          ports:
+            - "8080:8080"   # UI en 8080
+          depends_on:
+            dependency-track:
+              condition: service_started
+          networks: [appsec-net]
+
+        sonarqube:
+          image: sonarqube:community
+          container_name: sonarqube
+          restart: always
+          environment:
+            SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+          ports:
+            - "9000:9000"
+          volumes:
+            - /opt/sonarqube/data:/opt/sonarqube/data
+            - /opt/sonarqube/extensions:/opt/sonarqube/extensions
+            - /opt/sonarqube/logs:/opt/sonarqube/logs
+          networks: [appsec-net]
+
+      networks:
+        appsec-net:
+          name: appsec-net
+          driver: bridge
+
+  # systemd unit para levantar el stack al boot
+  - path: /etc/systemd/system/appsec-compose.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=AppSec Tools (SonarQube + Dependency-Track) via Docker Compose
+      After=network-online.target docker.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      WorkingDirectory=/opt/appsec
+      ExecStart=/usr/bin/docker-compose -f /opt/appsec/docker-compose.yml up -d
+      ExecStop=/usr/bin/docker-compose -f /opt/appsec/docker-compose.yml down
+      TimeoutStartSec=0
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # Docker y sysctl
+  - systemctl enable --now docker
+  - sysctl --system
+
+  # Directorios de datos
+  - mkdir -p /opt/dtrack/postgres /opt/dtrack/data
+  - mkdir -p /opt/sonarqube/data /opt/sonarqube/extensions /opt/sonarqube/logs
+
+  # Permisos correctos (DT usa UID 10001; Sonar UID 1000)
+  - chown -R 10001:10001 /opt/dtrack
+  - chmod -R 775 /opt/dtrack
+  - chown -R 1000:1000 /opt/sonarqube
+  - chmod -R 775 /opt/sonarqube
+
+  # Usuario local con acceso a docker (no bloquea si no existe)
+  - usermod -aG docker noel || true
+
+  # Red docker idempotente
+  - docker network create appsec-net || true
+
+  # Obtener IP pública vía IMDS (con fallback) y sustituir placeholder en el frontend
+  - |
+    PUBIP=$(curl -s -H Metadata:true 'http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text' || true)
+    if [ -z "$PUBIP" ]; then
+      PUBIP=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
+    fi
+    sed -i "s|http://__PUBLIC_API__:8081|http://$PUBIP:8081|g" /opt/appsec/docker-compose.yml
+
+  # Levantar stack y habilitar en boot
+  - systemctl daemon-reload
+  - systemctl enable --now appsec-compose.service

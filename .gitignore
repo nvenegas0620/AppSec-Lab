@@ -1,0 +1,17 @@
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log
+
+# Cloud-init templates output
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Backup files
+*.bak
+*.tmp
